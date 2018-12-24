@@ -17,6 +17,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
 import android.util.Log;
+import android.util.Base64;
 import android.content.pm.PackageManager;
 
 import org.apache.cordova.CordovaPlugin;
@@ -27,6 +28,14 @@ import org.apache.cordova.PermissionHelper;
 import com.google.zxing.client.android.CaptureActivity;
 import com.google.zxing.client.android.encode.EncodeActivity;
 import com.google.zxing.client.android.Intents;
+import com.google.zxing.common.BitSource;
+import com.google.zxing.common.CharacterSetECI;
+import com.google.zxing.common.StringUtils;
+import com.google.zxing.qrcode.decoder.Mode;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * This calls out to the ZXing barcode reader and returns the result.
@@ -221,8 +230,14 @@ public class BarcodeScanner extends CordovaPlugin {
                 JSONObject obj = new JSONObject();
                 try {
                     obj.put(TEXT, intent.getStringExtra("SCAN_RESULT"));
-                    obj.put(FORMAT, intent.getStringExtra("SCAN_RESULT_FORMAT"));
+                    String format = intent.getStringExtra("SCAN_RESULT_FORMAT");
+                    obj.put(FORMAT, format);
                     obj.put(CANCELLED, false);
+
+                    if ("QR_CODE".equals(format)) {
+                        byte[] bytes = extractBytes(intent);
+                        obj.put(DATA, Base64.encodeToString(bytes, Base64.NO_WRAP));
+                    }
                 } catch (JSONException e) {
                     Log.d(LOG_TAG, "This should never happen");
                 }
@@ -244,6 +259,58 @@ public class BarcodeScanner extends CordovaPlugin {
                 this.callbackContext.error("Unexpected error");
             }
         }
+    }
+
+    private byte[] extractBytes(Intent intent) {
+        try {
+            String text = intent.getStringExtra(Intents.Scan.RESULT);
+
+            // Check ECI encoding
+            byte[] content = intent.getByteArrayExtra(Intents.Scan.RESULT_BYTES);
+            BitSource bits = new BitSource(content);
+            Mode mode = Mode.forBits(bits.readBits(4));
+            if (mode == Mode.ECI) {
+                int count = -1;
+
+                int firstByte = bits.readBits(8);
+                if ((firstByte & 128) == 0) {
+                    count = firstByte & 127;
+                } else {
+                    int secondThirdBytes;
+                    if ((firstByte & 192) == 128) {
+                        secondThirdBytes = bits.readBits(8);
+                        count = (firstByte & 63) << 8 | secondThirdBytes;
+                    } else if ((firstByte & 224) == 192) {
+                        secondThirdBytes = bits.readBits(16);
+                        count = (firstByte & 31) << 16 | secondThirdBytes;
+                    }
+                }
+
+                String eciEncoding = CharacterSetECI.getCharacterSetECIByValue(count).name();
+                return text.getBytes(eciEncoding);
+            }
+
+            // guess encoding
+            Integer index = 0;
+            Set<String> encodings = new HashSet<>();
+
+            byte[] segment;
+            while ((segment = intent.getByteArrayExtra(Intents.Scan.RESULT_BYTE_SEGMENTS_PREFIX.concat(index.toString()))) != null) {
+                encodings.add(StringUtils.guessEncoding(segment, Collections.emptyMap()));
+                index++;
+            }
+
+            if (encodings.size() == 1) {
+                return text.getBytes((String) encodings.toArray()[0]);
+            } else {
+                return text.getBytes(CharacterSetECI.UTF8.name());
+            }
+
+        } catch (Exception e) {
+            // ignore
+        }
+
+        return new byte[0];
     }
 
     /**
