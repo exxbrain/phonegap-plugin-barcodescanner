@@ -115,6 +115,78 @@
 
 @end
 
+@interface ZXBitSource : NSObject
+
+@property (nonatomic, assign) int byteOffset;
+@property (nonatomic, assign) int bitOffset;
+@property (nonatomic, assign, readonly) int8_t *bytes;
+@property (nonatomic, assign, readonly) unsigned int length;
+
+- (id)initWithBytes:(int8_t *)bytes length:(unsigned int)length;
+- (int)readBits:(int)numBits;
+- (int)available;
+
+@end
+
+@implementation ZXBitSource
+
+- (id)initWithBytes:(int8_t *)bytes length:(unsigned int) length {
+    if (self = [super init]) {
+        _bytes = bytes;
+        _length = length;
+    }
+
+    return self;
+}
+
+- (int)readBits:(int)numBits {
+    if (numBits < 1 || numBits > 32 || numBits > self.available) {
+        [NSException raise:NSInvalidArgumentException format:@"Invalid number of bits: %d", numBits];
+    }
+
+    int result = 0;
+
+    // First, read remainder from current byte
+    if (self.bitOffset > 0) {
+        int bitsLeft = 8 - self.bitOffset;
+        int toRead = numBits < bitsLeft ? numBits : bitsLeft;
+        int bitsToNotRead = bitsLeft - toRead;
+        int mask = (0xFF >> (8 - toRead)) << bitsToNotRead;
+        result = (self.bytes[self.byteOffset] & mask) >> bitsToNotRead;
+        numBits -= toRead;
+        self.bitOffset += toRead;
+        if (self.bitOffset == 8) {
+            self.bitOffset = 0;
+            self.byteOffset++;
+        }
+    }
+
+    // Next read whole bytes
+    if (numBits > 0) {
+        while (numBits >= 8) {
+            result = (result << 8) | (self.bytes[self.byteOffset] & 0xFF);
+            self.byteOffset++;
+            numBits -= 8;
+        }
+
+        // Finally read a partial byte
+        if (numBits > 0) {
+            int bitsToNotRead = 8 - numBits;
+            int mask = (0xFF >> bitsToNotRead) << bitsToNotRead;
+            result = (result << numBits) | ((self.bytes[self.byteOffset] & mask) >> bitsToNotRead);
+            self.bitOffset += numBits;
+        }
+    }
+
+    return result;
+}
+
+- (int)available {
+    return 8 * (self.length - self.byteOffset) - self.bitOffset;
+}
+
+@end
+
 //------------------------------------------------------------------------------
 // plugin class
 //------------------------------------------------------------------------------
@@ -161,7 +233,7 @@
 
     NSDictionary* options;
     if (command.arguments.count == 0) {
-      options = [NSDictionary dictionary];
+        options = [NSDictionary dictionary];
     } else {
       options = command.arguments[0];
     }
@@ -250,13 +322,14 @@
 }
 
 //--------------------------------------------------------------------------
-- (void)returnSuccess:(NSString*)scannedText format:(NSString*)format cancelled:(BOOL)cancelled flipped:(BOOL)flipped callback:(NSString*)callback{
+- (void)returnSuccess:(NSString*)scannedText base64String:(NSString *)base64String format:(NSString*)format cancelled:(BOOL)cancelled flipped:(BOOL)flipped callback:(NSString*)callback{
     NSNumber* cancelledNumber = @(cancelled ? 1 : 0);
 
     NSMutableDictionary* resultDict = [NSMutableDictionary new];
     resultDict[@"text"] = scannedText;
     resultDict[@"format"] = format;
     resultDict[@"cancelled"] = cancelledNumber;
+    resultDict[@"data"] = base64String;
 
     CDVPluginResult* result = [CDVPluginResult
                                resultWithStatus: CDVCommandStatus_OK
@@ -415,13 +488,13 @@ parentViewController:(UIViewController*)parentViewController
 }
 
 //--------------------------------------------------------------------------
-- (void)barcodeScanSucceeded:(NSString*)text format:(NSString*)format {
+- (void)barcodeScanSucceeded:(NSString*)text base64String:(NSString *)base64String format:(NSString*)format {
     dispatch_sync(dispatch_get_main_queue(), ^{
         if (self.isSuccessBeepEnabled) {
             AudioServicesPlaySystemSound(_soundFileObject);
         }
         [self barcodeScanDone:^{
-            [self.plugin returnSuccess:text format:format cancelled:FALSE flipped:FALSE callback:self.callback];
+            [self.plugin returnSuccess:text base64String:base64String format:format cancelled:FALSE flipped:FALSE callback:self.callback];
         }];
     });
 }
@@ -578,7 +651,18 @@ parentViewController:(UIViewController*)parentViewController
             AVMetadataMachineReadableCodeObject* code = (AVMetadataMachineReadableCodeObject*)[self.previewLayer transformedMetadataObjectForMetadataObject:(AVMetadataMachineReadableCodeObject*)metaData];
 
             if ([self checkResult:code.stringValue]) {
-                [self barcodeScanSucceeded:code.stringValue format:[self formatStringFromMetadata:code]];
+                NSString *format = [self formatStringFromMetadata:code];
+                NSString *base64String = @"";
+
+                if ([format isEqualToString:@"QR_CODE"]) {
+                    NSStringEncoding encoding = [self encodingByCodeObject:code];
+                    NSData *data = [[code stringValue] dataUsingEncoding:encoding];
+                    base64String = [data base64EncodedStringWithOptions:nil];
+                }
+
+                [self barcodeScanSucceeded:code.stringValue
+                              base64String:base64String
+                                    format:format];
             }
         }
     }
@@ -590,6 +674,73 @@ parentViewController:(UIViewController*)parentViewController
     //        NSTimeInterval timeElapsed  = [NSDate timeIntervalSinceReferenceDate] - timeStart;
     //        NSLog(@"decoding completed in %dms", (int) (timeElapsed * 1000));
 
+}
+
+-(NSStringEncoding) encodingByCodeObject:(AVMetadataMachineReadableCodeObject *) code {
+    NSData *data = [code valueForKeyPath:@"_internal.basicDescriptor"][@"BarcodeRawData"];
+    unsigned int length = [data length] > 32 ? 32 : (unsigned int) [data length];
+    int8_t bytes[length];
+    [data getBytes:bytes range:NSMakeRange(0, length)];
+    ZXBitSource *bits = [[ZXBitSource alloc] initWithBytes:bytes length:length];
+    int possibleECI = [bits readBits:4];
+    NSStringEncoding encoding = NSISOLatin1StringEncoding;
+    if (possibleECI == 7) {
+        long count = -1;
+        long firstByte = [bits readBits:8];
+        if ((firstByte & 128) == 0) {
+            count = firstByte & 127;
+        } else {
+            long secondThirdBytes;
+            if ((firstByte & 192) == 128) {
+                secondThirdBytes = [bits readBits:8];
+                count = (firstByte & 63) << 8 | secondThirdBytes;
+            } else if ((firstByte & 224) == 192) {
+                secondThirdBytes = [bits readBits:16];
+                count = (firstByte & 31) << 16 | secondThirdBytes;
+            }
+        }
+
+        encoding = [self encodingByValue:count];
+    }
+    return encoding;
+}
+
+-(NSStringEncoding) encodingByValue:(long) value {
+    switch (value) {
+        case 0: return (NSStringEncoding) 0x80000400;
+        case 1: return NSISOLatin1StringEncoding;
+        case 2: return (NSStringEncoding) 0x80000400;
+        case 3: return NSISOLatin1StringEncoding;
+        case 4: return NSISOLatin2StringEncoding;
+        case 5: return (NSStringEncoding) 0x80000203;
+        case 6: return (NSStringEncoding) 0x80000204;
+        case 7: return (NSStringEncoding) 0x80000205;
+        case 8: return (NSStringEncoding) 0x80000206;
+        case 9: return (NSStringEncoding) 0x80000207;
+        case 10: return (NSStringEncoding) 0x80000208;
+        case 11: return (NSStringEncoding) 0x80000209;
+        case 12: return (NSStringEncoding) 0x8000020A;
+        case 13: return (NSStringEncoding) 0x8000020B;
+        case 15: return (NSStringEncoding) 0x8000020D;
+        case 16: return (NSStringEncoding) 0x8000020E;
+        case 17: return (NSStringEncoding) 0x8000020F;
+        case 18: return (NSStringEncoding) 0x80000210;
+        case 20: return NSShiftJISStringEncoding;
+        case 21: return NSWindowsCP1250StringEncoding;
+        case 22: return NSWindowsCP1251StringEncoding;
+        case 23: return NSWindowsCP1252StringEncoding;
+        case 24: return (NSStringEncoding) 0x80000505;
+        case 25: return NSUTF16BigEndianStringEncoding;
+        case 26: return NSUTF8StringEncoding;
+        case 27: return NSASCIIStringEncoding;
+        case 28: return (NSStringEncoding) 0x80000A03;
+        case 29: return (NSStringEncoding) 0x80000632;
+        case 30: return (NSStringEncoding) 0x80000940;
+        case 170: return NSASCIIStringEncoding;
+            break;
+        default:
+            return NSUTF8StringEncoding;
+    }
 }
 
 //--------------------------------------------------------------------------
