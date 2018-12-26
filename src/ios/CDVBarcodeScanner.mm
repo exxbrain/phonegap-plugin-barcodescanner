@@ -233,7 +233,7 @@
 
     NSDictionary* options;
     if (command.arguments.count == 0) {
-        options = [NSDictionary dictionary];
+      options = [NSDictionary dictionary];
     } else {
       options = command.arguments[0];
     }
@@ -654,11 +654,10 @@ parentViewController:(UIViewController*)parentViewController
                 NSString *format = [self formatStringFromMetadata:code];
                 NSString *base64String = @"";
 
-                if ([format isEqualToString:@"QR_CODE"]) {
-                    NSStringEncoding encoding = [self encodingByCodeObject:code];
-                    NSData *data = [[code stringValue] dataUsingEncoding:encoding];
-                    base64String = [data base64EncodedStringWithOptions:nil];
-                }
+                NSStringEncoding encoding = [self encodingByCodeObject:code];
+                NSData *data = [[code stringValue] dataUsingEncoding:encoding]
+                ?: [[code stringValue] dataUsingEncoding:NSUTF8StringEncoding];
+                base64String = [data base64EncodedStringWithOptions:nil];
 
                 [self barcodeScanSucceeded:code.stringValue
                               base64String:base64String
